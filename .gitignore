@@ -194,3 +194,18 @@ final_papers/
 # HF
 cache/
 huggingface/
+
+# User-specified ignores & local artifacts
+.env*
+activate_claude.sh
+activate_cluade.sh
+model/
+models/
+logs/
+.agents/
+ai_scientist/references/
+*.safetensors
+*.bin
+*.pth
+
+

@@ -1,6 +1,7 @@
 from concurrent.futures import ProcessPoolExecutor
 from typing import List, Optional, Set, Any, Callable, cast, Dict, Tuple
 import random
+import re
 import subprocess
 import os
 from queue import Queue
@@ -76,6 +77,123 @@ def _parse_keyword_prefix_response(
         logger.error(f"Error parsing response: {str(e)}")
         logger.debug(f"Raw response: {response}")
         return None, None
+
+
+# Markers of an implementation that invented its data instead of loading it.
+# Deliberately specific: the word "synthetic" on its own appears in perfectly
+# good code that merely forbids synthetic data, so matching it would reject the
+# very scripts we want.
+_FABRICATION_PATTERNS = [
+    (r"synthetic[_ ]?stand[_ ]?in", "declares a synthetic stand-in for a real dataset"),
+    (r"[\"']synthetic[\"']\s*:\s*True", "marks its data as synthetic"),
+    (r"synthetic_data_used[\"']?\s*[:=]\s*True", "records synthetic_data_used=True"),
+    # Assignment/call context only. A bare name would also match the entries of
+    # a blocklist like FORBIDDEN_MODEL_IDS = {"mock_model", ...}, i.e. reject
+    # the scripts that are defending against exactly this.
+    (r"\b(?:mock|fake)_(?:model|dataset|data)\s*[=(]",
+     "uses a mock model or dataset"),
+    (r"simulat(?:e|ed|ion)_(?:dataset|data|results|accuracy)",
+     "simulates its results"),
+]
+
+
+# Small open models that turn up as silent stand-ins when the required
+# checkpoint is large, gated or slow to load. A model chain that falls through
+# to one of these still runs, still reports accuracies, and never says which
+# model produced them.
+_SUBSTITUTE_MODEL_RE = re.compile(
+    r"Qwen[\d.]*/|Qwen[\d.]+-|SmolLM|TinyLlama|distilgpt2|\bgpt2\b|"
+    r"facebook/opt-|EleutherAI/pythia|bigscience/bloom|hf-internal-testing/|"
+    r"sshleifer/",
+    re.I,
+)
+
+
+def check_real_data(code: str) -> Optional[str]:
+    """Return every contract violation in `code` as one reason, or None.
+
+    All of them, not the first: each rejection costs a full generation, and
+    stopping at the earliest violation means the model fixes the fallback chain
+    without ever being told the mandated library is also missing.
+    """
+    reasons = []
+    for pattern, why in _FABRICATION_PATTERNS:
+        if re.search(pattern, code, re.I):
+            reasons.append(f"it {why}")
+    if "load_dataset" not in code:
+        reasons.append("it never calls load_dataset, so it loads no real data")
+    if "from_pretrained" not in code:
+        reasons.append("it never calls from_pretrained, so it loads no real model")
+    # The required checkpoint is part of the task, not an implementation detail.
+    # A fallback chain is the dangerous shape here: it loads a 135M stand-in on
+    # any error and the numbers downstream look perfectly ordinary.
+    required = os.environ.get("REQUIRE_MODEL_ID")
+    if required and required not in code:
+        reasons.append(f"it never names the required model {required}")
+    hit = _SUBSTITUTE_MODEL_RE.search(code)
+    if required and hit:
+        reasons.append(
+            f"it names the substitute model {hit.group(0)!r}, so it can silently "
+            "run on something other than the required checkpoint"
+        )
+    # Same hazard, but for stand-ins the built-in list cannot know about: an
+    # older release of the *same* family reads as a reasonable fallback and is
+    # still the wrong model. The launcher names them, since which siblings count
+    # as substitutes is a property of the task, not of this file.
+    for bad in filter(None, os.environ.get("FORBIDDEN_MODEL_SUBSTRINGS", "").split(",")):
+        if bad.strip() and bad.strip() in code:
+            reasons.append(
+                f"it names {bad.strip()!r}, which the task excludes as a "
+                "stand-in for the required checkpoint"
+            )
+    # Tooling the task mandates. Hand-rolled merge math passes every other check
+    # here -- it loads real data, real weights, and produces plausible numbers --
+    # so nothing else would notice that the required library was never used.
+    for mod in filter(None, os.environ.get("REQUIRE_IMPORT", "").split(",")):
+        mod = mod.strip()
+        if mod and not re.search(rf"^\s*(?:import|from)\s+{re.escape(mod)}\b",
+                                 code, re.M):
+            reasons.append(
+                f"it never imports {mod}, which the task requires it to be built on"
+            )
+    if not reasons:
+        return None
+    if len(reasons) == 1:
+        return f"the implementation {reasons[0]}"
+    return "the implementation has {} contract violations: {}".format(
+        len(reasons), "; ".join(f"({i}) {r}" for i, r in enumerate(reasons, 1))
+    )
+
+
+def _dump_failed_completion(completion_text: str, attempt: int) -> str:
+    """Persist a completion the code extractor rejected, and say why.
+
+    Extraction failure is silent by construction: `extract_code` compiles every
+    fenced block and drops the ones that do not parse, so a single syntax error
+    in a 1000-line generation is indistinguishable from the model never emitting
+    code at all. Each retry costs a full generation, so keep the evidence.
+    """
+    root = Path(os.environ.get("EXTRACT_FAIL_DIR", "logs/extract_failures"))
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"pid{os.getpid()}_attempt{attempt}.txt"
+        blocks = re.findall(r"```(?:python)?\n*(.*?)\n*```", completion_text or "",
+                            re.DOTALL)
+        why = []
+        for i, b in enumerate(blocks):
+            try:
+                compile(b, "<string>", "exec")
+                why.append(f"block {i}: compiles ({len(b)} chars)")
+            except SyntaxError as e:
+                why.append(f"block {i}: SyntaxError line {e.lineno}: {e.msg} "
+                           f"({len(b)} chars)")
+        header = (f"len={len(completion_text or '')} fences="
+                  f"{(completion_text or '').count('```')} blocks={len(blocks)}\n"
+                  + "\n".join(why) + "\n" + "-" * 60 + "\n")
+        path.write_text(header + (completion_text or ""))
+        return f"{path} ({'; '.join(why) or 'no fenced block'})"
+    except OSError as e:
+        return f"<could not write dump: {e}>"
 
 
 review_func_spec = FunctionSpec(
@@ -270,27 +388,62 @@ class MinimalAgent:
         self.stage_name = stage_name
         self.data_preview = None
 
+    # Packages the agent routinely assumes exist. We report the real answer for
+    # each: telling it "all packages are already installed" (the old prompt) is
+    # false, and every wrong guess costs a whole node to a ModuleNotFoundError.
+    _CANDIDATE_PKGS = [
+        "numpy", "pandas", "scikit-learn", "scipy", "statsmodels", "matplotlib",
+        "seaborn", "torch", "torchvision", "transformers", "peft", "datasets",
+        "accelerate", "tokenizers", "safetensors", "huggingface_hub", "trl",
+        "bitsandbytes", "deepspeed", "flash_attn", "vllm", "sentencepiece",
+        "evaluate", "xgboost", "lightgbm", "timm", "einops",
+    ]
+
     @property
     def _prompt_environment(self):
-        pkgs = [
-            "numpy",
-            "pandas",
-            "scikit-learn",
-            "statsmodels",
-            "xgboost",
-            "lightGBM",
-            "torch",
-            "torchvision",
-            "torch-geometric",
-            "bayesian-optimization",
-            "timm",
-            "albumentations",
-        ]
-        random.shuffle(pkgs)
-        pkg_str = ", ".join([f"`{p}`" for p in pkgs])
+        from importlib.metadata import version, PackageNotFoundError
+
+        _IMPORT_NAME = {"scikit-learn": "sklearn", "lightgbm": "lightgbm"}
+        installed, missing = [], []
+        for p in self._CANDIDATE_PKGS:
+            try:
+                installed.append(f"`{p}=={version(p)}`")
+            except PackageNotFoundError:
+                try:  # some are importable without dist metadata
+                    __import__(_IMPORT_NAME.get(p, p).replace("-", "_"))
+                    installed.append(f"`{p}`")
+                except Exception:
+                    missing.append(f"`{p}`")
+        random.shuffle(installed)
+
+        notes = []
+        if missing:
+            notes.append(
+                "NOT installed, and you must NOT import them (there is no way to "
+                f"install anything at runtime): {', '.join(sorted(missing))}. "
+                "If you need functionality from a missing package, write it by hand."
+            )
+        try:
+            import transformers
+
+            if int(transformers.__version__.split(".")[0]) >= 5:
+                notes.append(
+                    f"transformers is {transformers.__version__} (v5 API). "
+                    "`TrainingArguments(evaluation_strategy=...)` is gone — use "
+                    "`eval_strategy`. `from_pretrained(torch_dtype=...)` is now "
+                    "`dtype=...`. `gradient_checkpointing` is NOT a "
+                    "`from_pretrained` kwarg; call "
+                    "`model.gradient_checkpointing_enable()` instead."
+                )
+        except Exception:
+            pass
 
         env_prompt = {
-            "Installed Packages": f"Your solution can use any relevant machine learning packages such as: {pkg_str}. Feel free to use any other packages too (all packages are already installed!). For neural networks we suggest using PyTorch rather than TensorFlow."
+            "Installed Packages": (
+                f"These packages are installed: {', '.join(installed)}. "
+                "For neural networks use PyTorch rather than TensorFlow."
+                + ("\n" + "\n".join(notes) if notes else "")
+            )
         }
         return env_prompt
 
@@ -311,6 +464,15 @@ class MinimalAgent:
             "CRITICAL MODEL INPUT GUIDELINES:",
             "  - Always pay extra attention to the input to the model being properly normalized",
             "  - This is extremely important because the input to the model's forward pass directly affects the output, and the loss function is computed based on the output",
+            "CRITICAL IMPORT REQUIREMENTS - Your code MUST include ALL necessary imports at the top:",
+            "  - ALWAYS import standard libraries if used: `import math, argparse, os, sys`",
+            "  - ALWAYS use `from collections import OrderedDict` if you use OrderedDict.",
+            "  - DO NOT import `LoraConfig` from `transformers`. You MUST use `from peft import LoraConfig, get_peft_model`.",
+            "  - Double-check all string literals (especially f-strings) and brackets to ensure there are no SyntaxErrors.",
+            "CRITICAL RUNTIME & TYPE REQUIREMENTS:",
+            "  - DO NOT remove existing imports from the base template code.",
+            "  - DO NOT change the return signatures of existing helper functions. (e.g., if a function returns a model, do not try to unpack it as a tuple).",
+            "  - Ensure data structures match expected types to avoid unhashable type errors.",
         ]
         if hasattr(self.cfg.experiment, "num_syn_datasets"):
             num_syn_datasets = self.cfg.experiment.num_syn_datasets
@@ -658,7 +820,7 @@ class MinimalAgent:
     def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str]:
         """Generate a natural language plan + code in the same LLM call and split them apart."""
         completion_text = None
-        for _ in range(retries):
+        for _attempt in range(retries):
             completion_text = query(
                 system_message=prompt,
                 user_message=None,
@@ -672,8 +834,17 @@ class MinimalAgent:
             if code and nl_text:
                 # merge all code blocks into a single string
                 return nl_text, code
+            if code:
+                # A coder model very often replies with the fence first and no
+                # prose. Rejecting that wastes three calls and then hands the
+                # RAW markdown back as `code`, which cannot execute -- a
+                # guaranteed buggy node. The code is what matters; synthesise
+                # the plan rather than throwing a good completion away.
+                print("No prose before the code block; accepting the code anyway.")
+                return "(no plan text returned; see code)", code
 
-            print("Plan + code extraction failed, retrying...")
+            print("Plan + code extraction failed, retrying... "
+                  + _dump_failed_completion(completion_text, _attempt))
             prompt["Parsing Feedback"] = (
                 "The code extraction failed. Make sure to use the format ```python ... ``` for the code blocks."
             )
@@ -692,6 +863,14 @@ class MinimalAgent:
                 "You are an experienced AI researcher. "
                 "You have written code for your research experiment and now need to evaluate the output of the code execution. "
                 "Analyze the execution output, determine if there were any bugs, and provide a summary of the findings. "
+                "A run that executes cleanly is still a bug if it did not run the "
+                "experiment that was asked for. Before answering, check the "
+                "implementation against the experiment plan in the research idea: "
+                "every factor of the plan's grid must be present with all of its "
+                "levels, and the number of configurations actually swept must "
+                "match. Fewer rows or steps per configuration is fine; a missing "
+                "axis, a missing level, or a substituted model or dataset is not "
+                "-- report it as a bug and say which one is missing."
             ),
             "Research idea": self.task_desc,
             "Implementation": wrap_code(node.code),
@@ -709,8 +888,31 @@ class MinimalAgent:
             ),
         )
 
-        node.analysis = response["summary"]
-        node.is_buggy = response["is_bug"] or node.exc_type is not None
+        node.analysis = response.get("summary", "LLM failed to generate summary.")
+        node.is_buggy = response.get("is_bug", False) or node.exc_type is not None
+
+        # Deterministic real-data guard, opt-in via the launcher.
+        #
+        # The stage-1 goal asks for something "simple" and models read that as
+        # licence to simulate: one node here produced a complete 48-config
+        # sweep of pure RNG output in 12 seconds. The reviewer above scores
+        # that as a clean run -- it is internally consistent, so nothing in the
+        # output looks wrong -- which is exactly why this check cannot live in
+        # the reviewer. Nor can it live in the generated script, since the
+        # model is free to delete it there.
+        if os.environ.get("REQUIRE_REAL_DATA") == "1" and not node.is_buggy:
+            reason = check_real_data(node.code)
+            if reason:
+                node.is_buggy = True
+                node.analysis = (
+                    f"REJECTED by the real-data guard: {reason}. The task "
+                    "forbids synthetic, simulated or mock data and requires "
+                    "the real dataset and the real model to be loaded. Reduce "
+                    "the number of rows if you need it to run faster, but "
+                    "never replace real data with generated values.\n\n"
+                    + node.analysis
+                )
+                print(f"[red][real-data guard] node rejected: {reason}[/red]")
         print(
             "[red]Checking if response contains metric name and description[/red]",
             flush=True,
@@ -1088,21 +1290,50 @@ class MinimalAgent:
         )
 
 
+def visible_gpu_ids() -> list:
+    """Physical GPU ids this run is allowed to touch.
+
+    CUDA_VISIBLE_DEVICES is authoritative when set: workers re-export it as an
+    absolute device index (see _run_process), so allocating outside the parent's
+    pinning would drop experiment processes onto GPUs that are already hosting
+    the Qwen servers.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None:
+        return [d.strip() for d in cvd.split(",") if d.strip() and d.strip() != "-1"]
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return [l.strip() for l in out.stdout.strip().split("\n") if l.strip()]
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+
+
 class GPUManager:
     """Manages GPU allocation across processes"""
 
-    def __init__(self, num_gpus: int):
-        self.num_gpus = num_gpus
-        self.available_gpus: Set[int] = set(range(num_gpus))
-        self.gpu_assignments: Dict[str, int] = {}  # process_id -> gpu_id
+    def __init__(self, num_gpus: int, gpu_ids: list = None):
+        # Allocate from the *visible* ids, not range(num_gpus): with
+        # CUDA_VISIBLE_DEVICES=2,3 the valid ids are 2 and 3, not 0 and 1.
+        ids = gpu_ids if gpu_ids is not None else visible_gpu_ids()
+        if not ids:
+            ids = [str(i) for i in range(num_gpus)]
+        self.num_gpus = len(ids)
+        self.available_gpus: Set[str] = set(ids)
+        self.gpu_assignments: Dict[str, str] = {}  # process_id -> gpu_id
 
-    def acquire_gpu(self, process_id: str) -> int:
+    def acquire_gpu(self, process_id: str) -> str:
         """Assigns a GPU to a process"""
         if not self.available_gpus:
             raise RuntimeError("No GPUs available")
         print(f"Available GPUs: {self.available_gpus}")
         print(f"Process ID: {process_id}")
-        gpu_id = min(self.available_gpus)
+        # numeric order: min() on strings would pick "10" before "2"
+        gpu_id = min(self.available_gpus, key=lambda g: int(g))
         print(f"Acquiring GPU {gpu_id} for process {process_id}")
         self.available_gpus.remove(gpu_id)
         self.gpu_assignments[process_id] = gpu_id
@@ -1118,25 +1349,14 @@ class GPUManager:
 
 
 def get_gpu_count() -> int:
-    """Get number of available NVIDIA GPUs without using torch"""
-    try:
-        # First try using nvidia-smi
-        nvidia_smi = subprocess.run(
-            ["nvidia-smi", "--query-gpu=gpu_name", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        gpus = nvidia_smi.stdout.strip().split("\n")
-        return len(gpus)
-    except (subprocess.SubprocessError, FileNotFoundError):
-        # If nvidia-smi fails, try environment variable
-        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if cuda_visible_devices:
-            # Filter out empty strings and -1 values
-            devices = [d for d in cuda_visible_devices.split(",") if d and d != "-1"]
-            return len(devices)
-        return 0
+    """Number of GPUs this run may use.
+
+    CUDA_VISIBLE_DEVICES wins over nvidia-smi. Asking nvidia-smi first (the old
+    behaviour) reported every GPU on the node, so a run pinned to one GPU still
+    handed workers ids belonging to the GPUs serving Qwen -> two 90 GiB
+    processes on the same card and a CUDA OOM.
+    """
+    return len(visible_gpu_ids())
 
 
 class ParallelAgent:
@@ -1224,7 +1444,7 @@ class ParallelAgent:
     def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str]:
         """Generate a natural language plan + code in the same LLM call and split them apart."""
         completion_text = None
-        for _ in range(retries):
+        for _attempt in range(retries):
             completion_text = query(
                 system_message=prompt,
                 user_message=None,
@@ -1238,7 +1458,16 @@ class ParallelAgent:
             if code and nl_text:
                 # merge all code blocks into a single string
                 return nl_text, code
-            print("Plan + code extraction failed, retrying...")
+            if code:
+                # A coder model very often replies with the fence first and no
+                # prose. Rejecting that wastes three calls and then hands the
+                # RAW markdown back as `code`, which cannot execute -- a
+                # guaranteed buggy node. The code is what matters; synthesise
+                # the plan rather than throwing a good completion away.
+                print("No prose before the code block; accepting the code anyway.")
+                return "(no plan text returned; see code)", code
+            print("Plan + code extraction failed, retrying... "
+                  + _dump_failed_completion(completion_text, _attempt))
             prompt["Parsing Feedback"] = (
                 "The code extraction failed. Make sure to use the format ```python ... ``` for the code blocks."
             )
@@ -1411,7 +1640,7 @@ class ParallelAgent:
         node_data,
         task_desc,
         cfg,
-        gpu_id: int = None,
+        gpu_id: str = None,  # physical device id, e.g. "2" (see GPUManager)
         memory_summary: str = None,
         evaluation_metrics=None,
         stage_name=None,
@@ -1523,7 +1752,25 @@ class ParallelAgent:
 
             # Execute and parse results
             print("Running code")
-            exec_result = process_interpreter.run(child_node.code, True)
+            # Screen before spending the execution budget. These violations are
+            # decidable from the source alone, and a sweep of this size can run
+            # for hours before producing the result we already know we have to
+            # throw away. The node keeps its real code so the debug step has
+            # something to fix; only what gets executed is swapped out.
+            guard_reason = (
+                check_real_data(child_node.code)
+                if os.environ.get("REQUIRE_REAL_DATA") == "1"
+                else None
+            )
+            if guard_reason:
+                print(f"[red][real-data guard] not executing: {guard_reason}[/red]")
+                exec_result = process_interpreter.run(
+                    "raise SystemExit("
+                    f"{f'REJECTED before execution: {guard_reason}'!r})",
+                    True,
+                )
+            else:
+                exec_result = process_interpreter.run(child_node.code, True)
             process_interpreter.cleanup_session()
 
             print("Parsing execution results")

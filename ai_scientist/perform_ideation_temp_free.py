@@ -13,6 +13,7 @@ from ai_scientist.llm import (
     create_client,
     get_response_from_llm,
 )
+from ai_scientist.utils.logger import setup_file_logging, setup_logger
 
 from ai_scientist.tools.semantic_scholar import SemanticScholarSearchTool
 from ai_scientist.tools.base_tool import BaseTool
@@ -34,7 +35,10 @@ The IDEA JSON should include the following fields:
 - "Related Work": A brief discussion of the most relevant related work and how the proposal clearly distinguishes from it, and is not a trivial extension.
 - "Abstract": An abstract that summarizes the proposal in conference format (approximately 250 words).
 - "Experiments": A list of experiments that would be conducted to validate the proposal. Ensure these are simple and feasible. Be specific in exactly how you would test the hypothesis, and detail precise algorithmic changes. Include the evaluation metrics you would use.
-- "Risk Factors and Limitations": A list of potential risks and limitations of the proposal.""",
+- "Risk Factors and Limitations": A list of potential risks and limitations of the proposal.
+- "Novelty Score": An integer score from 1 to 10 assessing how novel the idea is based on your literature search.
+- "Feasibility Score": An integer score from 1 to 10 assessing how feasible it is to complete this research.
+- "Expected Impact": An integer score from 1 to 10 assessing the potential impact of the research if successful.""",
     },
 ]
 
@@ -86,7 +90,10 @@ IDEA JSON:
     "Related Work": "...",
     "Abstract": "...",
     "Experiments": "...",
-    "Risk Factors and Limitations": "..."
+    "Risk Factors and Limitations": "...",
+    "Novelty Score": 8,
+    "Feasibility Score": 9,
+    "Expected Impact": 7
   }}
 }}
 ```
@@ -135,6 +142,9 @@ def generate_temp_free_idea(
     reload_ideas: bool = True,
 ) -> List[Dict]:
     idea_str_archive = []
+    log_fname = idea_fname.replace(".json", "_ideation.log")
+    with open(log_fname, "w") as f:
+        f.write("=== Ideation Log ===\n")
     # load ideas from file
     if reload_ideas and osp.exists(idea_fname):
         with open(idea_fname, "r") as f:
@@ -178,11 +188,18 @@ def generate_temp_free_idea(
                     msg_history=msg_history,
                 )
 
+                with open(log_fname, "a") as f:
+                    f.write(f"\n--- Generation {gen_idx + 1}, Reflection {reflection_round + 1} ---\n")
+                    f.write(response_text + "\n")
+
                 # Parse the LLM's response
                 try:
                     # Use regular expressions to extract the components
+                    # 只取第一個 ACTION / ARGUMENTS 組合（Kimi 等模型可能一次輸出多個）
                     action_pattern = r"ACTION:\s*(.*?)\s*ARGUMENTS:"
-                    arguments_pattern = r"ARGUMENTS:\s*(.*?)(?:$|\nTHOUGHT:|\n$)"
+                    # Greedy to end-of-text so we capture the full JSON even if it
+                    # contains blank lines (which the old negative-lookahead would stop at).
+                    arguments_pattern = r"ARGUMENTS:\s*(.+)"
 
                     action_match = re.search(
                         action_pattern, response_text, re.DOTALL | re.IGNORECASE
@@ -205,16 +222,17 @@ def generate_temp_free_idea(
                             r"```json\s*(.*?)\s*```", arguments_text, re.DOTALL
                         ).group(1)
 
+                    # 只保留第一個完整的 JSON 物件，避免 Kimi 多輸出的內容干擾解析
+                    try:
+                        decoder = json.JSONDecoder()
+                        arguments_json, _ = decoder.raw_decode(arguments_text)
+                    except json.JSONDecodeError:
+                        raise ValueError(f"Invalid arguments JSON for {action}.")
+
                     # Process the action and arguments
                     if action in tools_dict:
                         # It's a tool we have defined
                         tool = tools_dict[action]
-                        # Parse arguments
-                        try:
-                            arguments_json = json.loads(arguments_text)
-                        except json.JSONDecodeError:
-                            raise ValueError(f"Invalid arguments JSON for {action}.")
-
                         # Use the tool
                         try:
                             # Assuming the arguments match the parameters of the tool
@@ -247,7 +265,19 @@ def generate_temp_free_idea(
                         f"Failed to parse LLM response. Response text:\n{response_text}"
                     )
                     traceback.print_exc()
-                    break  # Exit the loop if parsing fails
+                    with open(log_fname, "a") as f:
+                        f.write(f"\n[ERROR] Parsing failed: {str(e)}\n")
+                        f.write(traceback.format_exc() + "\n")
+                    # Do NOT break — continue to next reflection round so the LLM
+                    # gets another chance to emit the required ACTION/ARGUMENTS format.
+                    last_tool_results = (
+                        f"Your previous response could not be parsed. "
+                        f"You MUST reply in EXACTLY this format:\n\n"
+                        f"ACTION:\n<exactly one of {tool_names_str}>\n\n"
+                        f"ARGUMENTS:\n<JSON object>\n\n"
+                        f"Do NOT include any extra text before or after the ACTION block."
+                    )
+                    continue
 
             if idea_finalized:
                 continue  # Move to the next idea
@@ -263,10 +293,31 @@ def generate_temp_free_idea(
     with open(idea_fname, "w") as f:
         json.dump(ideas, f, indent=4)
     print(f"Stored {len(ideas)} ideas in {idea_fname}")
+
+    # Save metrics to CSV
+    import csv
+    csv_fname = idea_fname.replace(".json", "_metrics.csv")
+    with open(csv_fname, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Name", "Title", "Novelty Score", "Feasibility Score", "Expected Impact"])
+        for idea in ideas:
+            writer.writerow([
+                idea.get("Name", "Unknown"),
+                idea.get("Title", "Untitled"),
+                idea.get("Novelty Score", "N/A"),
+                idea.get("Feasibility Score", "N/A"),
+                idea.get("Expected Impact", "N/A")
+            ])
+    print(f"Stored idea metrics in {csv_fname}")
+    
     return ideas
 
 
 if __name__ == "__main__":
+    logger, log_path = setup_file_logging(__file__)
+    logger.info(f"=== Starting Idea Generation (perform_ideation_temp_free) ===")
+    logger.info(f"Log file: {log_path}")
+
     parser = argparse.ArgumentParser(
         description="Generate AI scientist proposals - template free"
     )
@@ -300,13 +351,22 @@ if __name__ == "__main__":
     # Create the LLM client
     client, client_model = create_client(args.model)
 
-    with open(args.workshop_file, "r") as f:
+    workshop_path = args.workshop_file
+    if osp.isdir(workshop_path):
+        # find the .md file inside the directory with the same name
+        basename = osp.basename(osp.abspath(workshop_path))
+        md_file = osp.join(workshop_path, f"{basename}.md")
+        if not osp.exists(md_file):
+            raise FileNotFoundError(f"Expected to find {md_file} inside {workshop_path}")
+        workshop_path = md_file
+
+    with open(workshop_path, "r") as f:
         workshop_description = f.read()
-    print(f"Using workshop description from {args.workshop_file} for idea generation.")
+    print(f"Using workshop description from {workshop_path} for idea generation.")
     print(f"Workshop description:\n{workshop_description}")
 
     # Create output filename by replacing .md extension with .json
-    idea_fname = args.workshop_file.replace(".md", ".json")
+    idea_fname = workshop_path.replace(".md", ".json")
     print("Starting idea generation for", idea_fname)
     ideas = generate_temp_free_idea(
         idea_fname=idea_fname,

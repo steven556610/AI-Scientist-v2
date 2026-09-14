@@ -149,7 +149,12 @@ class AgentManager:
         self.main_stage_goals: Dict[int, str] = {
             1: """
                 - Focus on getting basic working implementation
-                - Use a simple dataset
+                - Keep the data SMALL: use a subset of the real dataset (fewer
+                  rows, fewer splits). "Simple" means less data, never fake
+                  data. NEVER substitute synthetic, randomly generated,
+                  simulated or mock data for a real dataset, and never stub out
+                  loading a real model -- a run built on invented numbers is
+                  worthless no matter how fast it is.
                 - Aim for basic functional correctness
                 - If you are given \"Code To Use\", you can directly use it as a starting point.""",
             2: """
@@ -193,6 +198,19 @@ Your research idea:\n\n
             + self.task_desc["Short Hypothesis"]
             + "\n"
         )
+        # The experiment plan is the only place the idea states its factor grid
+        # -- which axes exist, how many levels each has, what the total config
+        # count must be. Left out, the agent implements whatever subset the
+        # abstract happens to mention and quietly drops entire axes, which reads
+        # as a working run rather than a missing experiment.
+        if "Experiments" in self.task_desc:
+            task_desc += (
+                "Experiment plan (the factor grid below is a specification, not "
+                "a suggestion: you may reduce rows/steps per configuration to fit "
+                "the time budget, but never drop an axis or a level from it):\n"
+                + self.task_desc["Experiments"]
+                + "\n"
+            )
         if "Code" in self.task_desc:
             task_desc += "Code To Use:\n" + self.task_desc["Code"] + "\n"
         return task_desc

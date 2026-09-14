@@ -29,6 +29,7 @@ AVAILABLE_VLMS = [
     "ollama/qwen2.5vl:32b",
 
     "ollama/z-uo/qwen2.5vl_tools:32b",
+    "local/qwen2.5-vl-32b",
 ]
 
 
@@ -97,6 +98,16 @@ def make_vlm_call(client, model, temperature, system_message, prompt):
     if model.startswith("ollama/"):
         return client.chat.completions.create(
             model=model.replace("ollama/", ""),
+            messages=[
+                {"role": "system", "content": system_message},
+                *prompt,
+            ],
+            temperature=temperature,
+            max_tokens=MAX_NUM_TOKENS,
+        )
+    elif model.startswith("local/"):
+        return client.chat.completions.create(
+            model=model,
             messages=[
                 {"role": "system", "content": system_message},
                 *prompt,
@@ -209,6 +220,24 @@ def create_client(model: str) -> tuple[Any, str]:
             api_key=os.environ.get("OLLAMA_API_KEY", ""),
             base_url="http://localhost:11434/v1"
         ), model
+    elif model.startswith("local/"):
+        print(f"Using Local API with model {model}.")
+        return openai.OpenAI(
+            api_key="none",
+            base_url="http://localhost:8000/v1"
+        ), model
+    elif model == "kimi-k3":
+        # The writeup path calls this factory with --model_writeup_small for
+        # figure description. backend_openai.py and llm.py both know kimi-k3;
+        # this factory did not, so the whole writeup died with
+        # "ValueError: Model kimi-k3 not supported." Verified 2026-09-09 that
+        # this endpoint accepts image_url content parts.
+        print(f"Using Kimi (DGX internal) with model {model}.")
+        return openai.OpenAI(
+            api_key=os.environ.get("KIMI_API_KEY", "none"),
+            base_url=os.environ.get("KIMI_API_BASE", "http://r04dgx05:8000/v1"),
+            timeout=float(os.environ.get("KIMI_TIMEOUT", 3600)),
+        ), model
     else:
         raise ValueError(f"Model {model} not supported.")
 
@@ -304,6 +333,18 @@ def get_batch_responses_from_vlm(
         if model.startswith("ollama/"):
             response = client.chat.completions.create(
                 model=model.replace("ollama/", ""),
+                messages=[
+                    {"role": "system", "content": system_message},
+                    *new_msg_history,
+                ],
+                temperature=temperature,
+                max_tokens=MAX_NUM_TOKENS,
+                n=n_responses,
+                seed=0,
+            )
+        elif model.startswith("local/"):
+            response = client.chat.completions.create(
+                model=model,
                 messages=[
                     {"role": "system", "content": system_message},
                     *new_msg_history,

@@ -1,0 +1,9 @@
+seed: 42
+n_sequences: 200
+sequence_len: 50
+forecast_horizons: [5, 10, 20, 40]
+degradation_types:
+  - fog
+  - soiling
+  - rain
+  - blur

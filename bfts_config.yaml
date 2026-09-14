@@ -16,14 +16,19 @@ exp_name: run # a random experiment name will be generated if not provided
 
 # settings for code execution
 exec:
-  timeout: 3600
+  # The idea's grid is 48 merge+evaluate configurations of a 5B model, and the
+  # guided MoE cells cost ~300 s each. That does not fit in an hour, and the
+  # agent's response to the squeeze was to delete a level of the grid twice --
+  # first dare_ties, then MoE entirely -- which is the one trade the plan
+  # forbids. Give the sweep room to be run in full instead.
+  timeout: 10800
   agent_file_name: runfile.py
   format_tb_ipython: False
 
 generate_report: True
 # LLM settings for final report from journal
 report:
-  model: gpt-4o-2024-11-20
+  model: kimi-k3
   temp: 1.0
 
 experiment:
@@ -48,25 +53,30 @@ agent:
   multi_seed_eval:
     num_seeds: 3 # should be the same as num_workers if num_workers < 3. Otherwise, set it to be 3.
   # whether to instruct the agent to generate a prediction function
-  expose_prediction: False
+  expose_prediction: True
   # whether to provide the agent with a preview of the data
-  data_preview: False
+  data_preview: True
 
   # LLM settings for coding
   code:
-    model: anthropic.claude-3-5-sonnet-20241022-v2:0
-    temp: 1.0
-    max_tokens: 12000
+    model: kimi-k3
+    # Every debug iteration rewrites the whole ~1200-line script. At temp 1.0
+    # that drifts: blocks that fail to compile (which extract_code discards
+    # silently, costing a full retry) and dead-code placeholders such as
+    # `x = real_call(...) if False else (None, None)`, which clobbered the model
+    # with None. Sampling diversity buys nothing on a rewrite -- the plan is
+    # already fixed by the parent node.
+    temp: 0.4
+    max_tokens: 32768
 
   # LLM settings for evaluating program output / tracebacks
   feedback:
-    model: gpt-4o-2024-11-20
-    # gpt-4o
+    model: kimi-k3
     temp: 0.5
-    max_tokens: 8192
+    max_tokens: 32768
 
   vlm_feedback:
-    model: gpt-4o-2024-11-20
+    model: local/qwen2.5-vl-32b
     temp: 0.5
     max_tokens: null
 
@@ -78,10 +88,10 @@ agent:
   # Options for summarizing findings and selecting the best node
   # If not specified, the default behavior will be used.
 
-  # summary:
-  #   model: gpt-4o
-  #   temp: 0.3
+  summary:
+    model: kimi-k3
+    temp: 0.3
 
-  # select_node:
-  #   model: gpt-4o
-  #   temp: 0.3
+  select_node:
+    model: kimi-k3
+    temp: 0.3

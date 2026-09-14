@@ -9,6 +9,13 @@ import backoff
 from ai_scientist.tools.base_tool import BaseTool
 
 
+# Bounds on the Semantic Scholar calls below. Every one of these was previously
+# unbounded, which made a slow/rate-limited S2 look like a hung pipeline.
+S2_TIMEOUT = float(os.getenv("S2_TIMEOUT", 30))        # per-request socket timeout
+S2_MAX_TRIES = int(os.getenv("S2_MAX_TRIES", 5))       # retry ceiling
+S2_MAX_TIME = float(os.getenv("S2_MAX_TIME", 120))     # total seconds spent retrying
+
+
 def on_backoff(details: Dict) -> None:
     print(
         f"Backing off {details['wait']:0.1f} seconds after {details['tries']} tries "
@@ -43,7 +50,14 @@ class SemanticScholarSearchTool(BaseTool):
             )
 
     def use_tool(self, query: str) -> Optional[str]:
-        papers = self.search_for_papers(query)
+        try:
+            papers = self.search_for_papers(query)
+        except Exception as e:
+            # Literature search is an aid, not a hard dependency. Once the
+            # bounded retries above are exhausted the run must keep going
+            # instead of dying or hanging.
+            print(f"[S2] search failed after retries ({type(e).__name__}: {e}); continuing without results.")
+            return "No papers found (Semantic Scholar unavailable)."
         if papers:
             return self.format_papers(papers)
         else:
@@ -51,17 +65,25 @@ class SemanticScholarSearchTool(BaseTool):
 
     @backoff.on_exception(
         backoff.expo,
-        (requests.exceptions.HTTPError, requests.exceptions.ConnectionError),
+        (
+            requests.exceptions.HTTPError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ),
         on_backoff=on_backoff,
+        # Without max_tries/max_time this retried forever, so a Semantic Scholar
+        # outage or a sustained 429 silently hung the whole ideation run.
+        max_tries=S2_MAX_TRIES,
+        max_time=S2_MAX_TIME,
     )
     def search_for_papers(self, query: str) -> Optional[List[Dict]]:
         if not query:
             return None
-        
+
         headers = {}
         if self.S2_API_KEY:
             headers["X-API-KEY"] = self.S2_API_KEY
-        
+
         rsp = requests.get(
             "https://api.semanticscholar.org/graph/v1/paper/search",
             headers=headers,
@@ -70,6 +92,9 @@ class SemanticScholarSearchTool(BaseTool):
                 "limit": self.max_results,
                 "fields": "title,authors,venue,year,abstract,citationCount",
             },
+            # No timeout at all previously: a stalled socket blocked the run
+            # indefinitely without ever printing a backoff message.
+            timeout=S2_TIMEOUT,
         )
         print(f"Response Status Code: {rsp.status_code}")
         print(f"Response Content: {rsp.text[:500]}")
@@ -99,7 +124,15 @@ Abstract: {paper.get("abstract", "No abstract available.")}"""
 
 
 @backoff.on_exception(
-    backoff.expo, requests.exceptions.HTTPError, on_backoff=on_backoff
+    backoff.expo,
+    (
+        requests.exceptions.HTTPError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+    ),
+    on_backoff=on_backoff,
+    max_tries=S2_MAX_TRIES,
+    max_time=S2_MAX_TIME,
 )
 def search_for_papers(query, result_limit=10) -> Union[None, List[Dict]]:
     S2_API_KEY = os.getenv("S2_API_KEY")
@@ -122,6 +155,7 @@ def search_for_papers(query, result_limit=10) -> Union[None, List[Dict]]:
             "limit": result_limit,
             "fields": "title,authors,venue,year,abstract,citationStyles,citationCount",
         },
+        timeout=S2_TIMEOUT,
     )
     print(f"Response Status Code: {rsp.status_code}")
     print(

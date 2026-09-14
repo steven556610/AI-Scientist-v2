@@ -1,0 +1,6 @@
+Name,Title,Novelty Score,Feasibility Score,Expected Impact
+crosslorauniversalmerging,Universal Language Model Merging: Cross-LoRA Knowledge Injection for Multi-Domain MoE and Dense Architectures,8,9,7
+crossmodalknowledgetransferforllms,Cross-Modal Knowledge Transfer for Enhancing Multi-Modality in Large Language Models,8,8,9
+metalearningfewshotdomainadaptation,Meta-Learning for Few-Shot Domain Adaptation in Natural Language Processing,8,9,8
+selfsupervisedfewshotnlp,Self-Supervised Learning for Few-Shot Domain Adaptation in NLP,8,9,8
+contextualizedfewshotnlp,Contextualized Few-Shot Learning for Cross-Domain Natural Language Processing,8,9,8

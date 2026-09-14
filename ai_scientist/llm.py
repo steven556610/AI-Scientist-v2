@@ -8,7 +8,7 @@ import anthropic
 import backoff
 import openai
 
-MAX_NUM_TOKENS = 4096
+MAX_NUM_TOKENS = int(os.environ.get("MAX_NUM_TOKENS", 32768))
 
 AVAILABLE_LLMS = [
     "claude-3-5-sonnet-20240620",
@@ -59,6 +59,10 @@ AVAILABLE_LLMS = [
     "ollama/qwen3:32b",
     "ollama/qwen3:235b",
 
+    "local/qwen-72b",
+    "local/qwen2.5-vl-32b",
+    "local/qwen3-coder-30b-a3b-instruct",
+
     "ollama/qwen2.5vl:8b",
     "ollama/qwen2.5vl:32b",
 
@@ -70,6 +74,10 @@ AVAILABLE_LLMS = [
     "ollama/deepseek-r1:32b",
     "ollama/deepseek-r1:70b",
     "ollama/deepseek-r1:671b",
+    # Kimi-K3 via DGX internal endpoint
+    "kimi-k3",
+    # Gemma via Foxconn internal endpoint
+    "gemma-4-31b-it",
 ]
 
 
@@ -98,10 +106,10 @@ def get_batch_responses_from_llm(
     if msg_history is None:
         msg_history = []
 
-    if model.startswith("ollama/"):
+    if model.startswith("ollama/") or model.startswith("local/"):
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
         response = client.chat.completions.create(
-            model=model.replace("ollama/", ""),
+            model=model.replace("ollama/", "").replace("local/", ""),
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
@@ -184,6 +192,26 @@ def get_batch_responses_from_llm(
         new_msg_history = [
             new_msg_history + [{"role": "assistant", "content": c}] for c in content
         ]
+    elif model in ["kimi-k3", "gemma-4-31b-it"]:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        
+        dynamic_max_tokens = int(os.environ.get("KIMI_MAX_TOKENS", MAX_NUM_TOKENS)) if "kimi" in model else int(os.environ.get("GEMMA_MAX_TOKENS", MAX_NUM_TOKENS))
+        
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=dynamic_max_tokens,
+            n=n_responses,
+            stop=None,
+        )
+        content = [r.message.content for r in response.choices]
+        new_msg_history = [
+            new_msg_history + [{"role": "assistant", "content": c}] for c in content
+        ]
     else:
         content, new_msg_history = [], []
         for _ in range(n_responses):
@@ -214,9 +242,9 @@ def get_batch_responses_from_llm(
 
 @track_token_usage
 def make_llm_call(client, model, temperature, system_message, prompt):
-    if model.startswith("ollama/"):
+    if model.startswith("ollama/") or model.startswith("local/"):
         return client.chat.completions.create(
-            model=model.replace("ollama/", ""),
+            model=model.replace("ollama/", "").replace("local/", ""),
             messages=[
                 {"role": "system", "content": system_message},
                 *prompt,
@@ -309,10 +337,10 @@ def get_response_from_llm(
                 ],
             }
         ]
-    elif model.startswith("ollama/"):
+    elif model.startswith("ollama/") or model.startswith("local/"):
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
         response = client.chat.completions.create(
-            model=model.replace("ollama/", ""),
+            model=model.replace("ollama/", "").replace("local/", ""),
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
@@ -434,6 +462,23 @@ def get_response_from_llm(
         )
         content = response.choices[0].message.content
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif model in ["kimi-k3", "gemma-4-31b-it"]:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        
+        dynamic_max_tokens = int(os.environ.get("KIMI_MAX_TOKENS", MAX_NUM_TOKENS)) if "kimi" in model else int(os.environ.get("GEMMA_MAX_TOKENS", MAX_NUM_TOKENS))
+        
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=dynamic_max_tokens,
+            n=1,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
     else:
         raise ValueError(f"Model {model} not supported.")
 
@@ -489,24 +534,37 @@ def create_client(model) -> tuple[Any, str]:
         client_model = model.split("/")[-1]
         print(f"Using Vertex AI with model {client_model}.")
         return anthropic.AnthropicVertex(), client_model
+    elif model.startswith("local/"):
+        if "coder" in model.lower():
+            port = 8004
+        else:
+            port = 8000 if "vl" in model.lower() else 8002
+        print(f"Using Local API (port {port}) with model {model}.")
+        return openai.OpenAI(
+            api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+            base_url=f"http://localhost:{port}/v1",
+            timeout=3600.0,
+        ), model
     elif model.startswith("ollama/"):
         print(f"Using Ollama with model {model}.")
         return openai.OpenAI(
             api_key=os.environ.get("OLLAMA_API_KEY", ""),
             base_url="http://localhost:11434/v1",
+            timeout=3600.0,
         ), model
     elif "gpt" in model:
         print(f"Using OpenAI API with model {model}.")
-        return openai.OpenAI(), model
+        return openai.OpenAI(timeout=3600.0), model
     elif "o1" in model or "o3" in model:
         print(f"Using OpenAI API with model {model}.")
-        return openai.OpenAI(), model
+        return openai.OpenAI(timeout=3600.0), model
     elif model == "deepseek-coder-v2-0724":
         print(f"Using OpenAI API with {model}.")
         return (
             openai.OpenAI(
                 api_key=os.environ["DEEPSEEK_API_KEY"],
                 base_url="https://api.deepseek.com",
+                timeout=3600.0,
             ),
             model,
         )
@@ -519,6 +577,7 @@ def create_client(model) -> tuple[Any, str]:
             openai.OpenAI(
                 api_key=os.environ["HUGGINGFACE_API_KEY"],
                 base_url="https://api-inference.huggingface.co/models/agentica-org/DeepCoder-14B-Preview",
+                timeout=3600.0,
             ),
             model,
         )
@@ -528,6 +587,7 @@ def create_client(model) -> tuple[Any, str]:
             openai.OpenAI(
                 api_key=os.environ["OPENROUTER_API_KEY"],
                 base_url="https://openrouter.ai/api/v1",
+                timeout=3600.0,
             ),
             "meta-llama/llama-3.1-405b-instruct",
         )
@@ -537,8 +597,29 @@ def create_client(model) -> tuple[Any, str]:
             openai.OpenAI(
                 api_key=os.environ["GEMINI_API_KEY"],
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                timeout=3600.0,
             ),
             model,
+        )
+    elif model == "kimi-k3":
+        print(f"Using Kimi (DGX internal) with model {model}.")
+        return (
+            openai.OpenAI(
+                api_key=os.environ.get("KIMI_API_KEY", "none"),
+                base_url=os.environ.get("KIMI_API_BASE", "http://r04dgx05:8000/v1"),
+                timeout=3600.0,
+            ),
+            os.environ.get("KIMI_MODEL", "kimi-k3"),
+        )
+    elif model == "gemma-4-31b-it":
+        print(f"Using Gemma (Foxconn internal) with model {model}.")
+        return (
+            openai.OpenAI(
+                api_key=os.environ.get("GEMMA_API_KEY", "none"),
+                base_url=os.environ.get("GEMMA_API_BASE", "https://afspod-services.ai.foxconn.com/967bbcd1-9600-4e4a-a436-de1d096902c5/gemma-api/v1"),
+                timeout=3600.0,
+            ),
+            os.environ.get("GEMMA_MODEL", "gemma-4-31b-it"),
         )
     else:
         raise ValueError(f"Model {model} not supported.")

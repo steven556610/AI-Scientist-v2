@@ -304,6 +304,15 @@ def overall_summarize(journals, cfg=None):
         annotate_history(journal, cfg=cfg)
         if idx in [1, 2]:
             best_node = journal.get_best_node(cfg=cfg)
+            if best_node is None:
+                # No node in this stage produced a usable metric. Report that
+                # instead of crashing the whole summarization with an
+                # AttributeError on None.
+                print(
+                    f"[log_summarization] stage '{stage_name}' has no best node "
+                    f"(no node reported a valid metric); summarizing as empty."
+                )
+                return {"best node": None, "best node with different seeds": []}
             # get multi-seed results and aggregater node
             child_nodes = best_node.children
             multi_seed_nodes = [
@@ -356,7 +365,24 @@ def overall_summarize(journals, cfg=None):
                 total=len(list(journals)),
             )
         )
-        draft_summary, baseline_summary, research_summary, ablation_summary = results
+    # A run that stopped early (e.g. only stage 1 produced a journal) yields
+    # fewer than 4 results; unpacking blindly used to raise
+    # "ValueError: not enough values to unpack (expected 4, got 1)" and throw
+    # away the stages that *did* succeed. Pad instead, and let the writeup work
+    # with whatever is available.
+    if len(results) < 4:
+        print(
+            f"[log_summarization] only {len(results)} of 4 stages produced a journal; "
+            f"the missing stages will be summarized as empty."
+        )
+        # typed empties: stages 0-2 are dict-shaped, stage 3 is list-shaped
+        empties = [{}, {}, {}, []]
+        results = list(results) + empties[len(results):]
+    elif len(results) > 4:
+        print(f"[log_summarization] {len(results)} journals found; using the first 4.")
+        results = list(results)[:4]
+
+    draft_summary, baseline_summary, research_summary, ablation_summary = results
 
     return draft_summary, baseline_summary, research_summary, ablation_summary
 
