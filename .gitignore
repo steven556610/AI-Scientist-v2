@@ -207,5 +207,5 @@ ai_scientist/references/
 *.safetensors
 *.bin
 *.pth
-
+ai_scientist/ideas
 
