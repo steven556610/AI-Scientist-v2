@@ -1,6 +1,0 @@
-Name,Title,Novelty Score,Feasibility Score,Expected Impact
-interferencefreemodelmerginglora,Interference-Free Model Merging: Harmonizing Multi-Domain LoRA Adapters for Qwen-72B,8,9,7
-sparseparameterselectionforlora,Sparse Parameter Selection for Efficient LoRA Adapter Merging in Large Language Models,8,9,7
-adaptparamsharelora,Adaptive Parameter Sharing for Efficient LoRA Adapter Merging in Large Language Models,8,9,7
-dynamicloraallocation,Dynamic LoRA Allocation for Adaptive Task-Specific Fine-Tuning in Large Language Models,8,9,7
-metalearningforloraadaptation,Meta-Learning for Efficient Few-Shot LoRA Adaptation in Large Language Models,8,9,7
